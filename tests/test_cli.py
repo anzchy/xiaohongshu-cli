@@ -687,3 +687,38 @@ class TestTokenCommand:
 
         assert result.exit_code != 0
         assert "xsec_token" in result.output
+
+
+class TestShortLinkHosts:
+    FULL = "https://www.xiaohongshu.com/discovery/item/abc123?xsec_token=tok-cn&xsec_source=app_share"
+
+    def _mock(self, monkeypatch, seen):
+        import httpx
+
+        def handler(request):
+            seen.append(str(request.url))
+            return httpx.Response(302, headers={"location": self.FULL})
+
+        monkeypatch.setattr(
+            "xhs_cli.note_refs._redirect_client", lambda: httpx.Client(transport=httpx.MockTransport(handler))
+        )
+
+    def test_xhslink_cn_share_text_is_expanded(self, monkeypatch):
+        seen = []
+        self._mock(monkeypatch, seen)
+
+        share = "好用的电压力锅，工程师会怎么选（二） 接上篇内容，... https://xhslink.cn/o/4g50FGN2BHT"
+        result = runner.invoke(cli, ["token", share, "--json"])
+
+        assert result.exit_code == 0, result.output
+        assert seen == ["https://xhslink.cn/o/4g50FGN2BHT"]
+        assert yaml.safe_load(result.output)["data"]["note_id"] == "abc123"
+
+    def test_host_merely_containing_xhslink_is_not_fetched(self, monkeypatch):
+        seen = []
+        self._mock(monkeypatch, seen)
+
+        result = runner.invoke(cli, ["token", "http://127.0.0.1:8080/private?xhslink.com"])
+
+        assert seen == []
+        assert result.exit_code != 0

@@ -159,3 +159,17 @@ def test_media_failure_marks_note_not_ok_and_exits_nonzero(monkeypatch, tmp_path
     [entry] = payload["data"]["results"]
     assert entry["ok"] is False
     assert entry["failed"] == ["image 01"]
+
+
+def test_download_accepts_share_text_with_short_link(fake_client, tmp_path, monkeypatch):
+    full = "https://www.xiaohongshu.com/discovery/item/abc123?xsec_token=tok-cn&xsec_source=app_share"
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        "xhs_cli.note_refs._redirect_client",
+        lambda: real_client(transport=httpx.MockTransport(lambda r: httpx.Response(302, headers={"location": full}))),
+    )
+
+    result, payload = run_json(["好用的电压力锅（二） https://xhslink.cn/o/4g50FGN2BHT", "-o", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert fake_client.detail_calls == [("abc123", "tok-cn")]

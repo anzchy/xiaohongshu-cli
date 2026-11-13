@@ -360,7 +360,11 @@ class ReadingEndpointsMixin:
         if token:
             try:
                 return self.get_note_by_id(note_id, xsec_token=token, xsec_source=source)
-            except (NeedVerifyError, XhsApiError) as exc:
+            except NeedVerifyError:
+                # A captcha applies to the whole session; the HTML page would be blocked too.
+                # Surface it so batch callers can stop instead of masking it.
+                raise
+            except XhsApiError as exc:
                 logger.info("Feed API failed (%s), falling back to HTML", exc)
                 if used_cached_context:
                     invalidate_note_context(note_id)
@@ -432,13 +436,15 @@ class ReadingEndpointsMixin:
         note_id: str,
         xsec_token: str = "",
         xsec_source: str = "",
-        max_pages: int = 20,
+        max_pages: int | None = 20,
     ) -> dict[str, Any]:
+        """Fetch comment pages until exhausted (``max_pages=None``) or *max_pages* is reached."""
         all_comments: list[dict[str, Any]] = []
         cursor = ""
         pages = 0
+        seen_cursors: set[str] = set()
 
-        while pages < max_pages:
+        while max_pages is None or pages < max_pages:
             data = self.get_comments(
                 note_id,
                 cursor=cursor,
@@ -454,8 +460,9 @@ class ReadingEndpointsMixin:
 
             has_more = data.get("has_more", False)
             next_cursor = data.get("cursor", "")
-            if not has_more or not next_cursor:
+            if not has_more or not next_cursor or next_cursor in seen_cursors:
                 break
+            seen_cursors.add(next_cursor)
             cursor = next_cursor
 
         return {

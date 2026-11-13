@@ -314,3 +314,129 @@ class TestSubComments:
             client.close()
 
         assert captured["params"]["xsec_token"] == "cached-tok"
+
+
+class TestNoteDetailCaptcha:
+    def test_captcha_on_feed_api_propagates_instead_of_html_fallback(self, monkeypatch):
+        from xhs_cli.exceptions import NeedVerifyError
+
+        def captcha(self, note_id, xsec_token="", xsec_source=""):
+            raise NeedVerifyError("slide", "uuid-1")
+
+        def html_must_not_run(self, *a, **k):
+            raise AssertionError("HTML fallback must not run after a captcha")
+
+        monkeypatch.setattr(XhsClient, "get_note_by_id", captcha)
+        monkeypatch.setattr(XhsClient, "get_note_from_html", html_must_not_run)
+        client = XhsClient({"a1": "cookie"})
+        try:
+            with pytest.raises(NeedVerifyError):
+                client.get_note_detail("note-1", xsec_token="tok")
+        finally:
+            client.close()
+
+
+class TestResponseHandling:
+    """_main_api_get end to end over a mocked transport: status/code -> exception mapping and retries."""
+
+    def _client(self, monkeypatch, responses):
+        sleeps = []
+        monkeypatch.setattr("xhs_cli.client.time.sleep", lambda s: sleeps.append(s))
+        queue = list(responses)
+
+        def handler(request):
+            return queue.pop(0) if len(queue) > 1 else queue[0]
+
+        client = XhsClient({"a1": "a" * 52}, request_delay=0)
+        client._http = httpx.Client(transport=httpx.MockTransport(handler))
+        return client, sleeps
+
+    def _get(self, client):
+        try:
+            return client._main_api_get("/api/test", {"x": 1})
+        finally:
+            client.close()
+
+    def test_success_returns_data(self, monkeypatch):
+        client, _ = self._client(monkeypatch, [httpx.Response(200, json={"success": True, "data": {"k": 1}})])
+        assert self._get(client) == {"k": 1}
+
+    @pytest.mark.parametrize("status", [461, 471])
+    def test_captcha_status_raises_need_verify_with_headers_and_cools_down(self, monkeypatch, status):
+        from xhs_cli.exceptions import NeedVerifyError
+
+        resp = httpx.Response(status, headers={"verifytype": "slide", "verifyuuid": "u-1"})
+        client, sleeps = self._client(monkeypatch, [resp])
+        with pytest.raises(NeedVerifyError) as exc:
+            self._get(client)
+        assert (exc.value.verify_type, exc.value.verify_uuid) == ("slide", "u-1")
+        assert sleeps == [5]
+
+    @pytest.mark.parametrize(
+        ("code", "exc_name"),
+        [(300012, "IpBlockedError"), (300015, "SignatureError"), (-100, "SessionExpiredError")],
+    )
+    def test_api_error_codes_map_to_specific_exceptions(self, monkeypatch, code, exc_name):
+        import xhs_cli.exceptions as exceptions
+
+        client, _ = self._client(monkeypatch, [httpx.Response(200, json={"success": False, "code": code})])
+        with pytest.raises(getattr(exceptions, exc_name)):
+            self._get(client)
+
+    def test_unknown_error_code_raises_generic_api_error_with_code(self, monkeypatch):
+        client, _ = self._client(monkeypatch, [httpx.Response(200, json={"success": False, "code": -1})])
+        with pytest.raises(XhsApiError) as exc:
+            self._get(client)
+        assert exc.value.code == -1
+
+    def test_non_json_body_raises_api_error(self, monkeypatch):
+        client, _ = self._client(monkeypatch, [httpx.Response(200, text="<html>blocked</html>")])
+        with pytest.raises(XhsApiError, match="Non-JSON"):
+            self._get(client)
+
+    def test_5xx_is_retried_then_succeeds(self, monkeypatch):
+        client, sleeps = self._client(
+            monkeypatch,
+            [httpx.Response(503), httpx.Response(200, json={"success": True, "data": "ok"})],
+        )
+        assert self._get(client) == "ok"
+        assert len(sleeps) == 1
+
+    def test_persistent_5xx_gives_up_after_max_retries(self, monkeypatch):
+        client, sleeps = self._client(monkeypatch, [httpx.Response(502)])
+        with pytest.raises(XhsApiError, match="after 3 retries"):
+            self._get(client)
+        assert len(sleeps) == 3
+
+
+class TestAllComments:
+    def _paged(self, monkeypatch, pages: int, *, repeat_after: int | None = None):
+        calls = []
+
+        def fake_get_comments(self, note_id, cursor="", **kwargs):
+            calls.append(cursor)
+            n = int(cursor or 0)
+            nxt = str(n + 1) if repeat_after is None or n < repeat_after else cursor
+            return {"comments": [{"id": f"c{n}"}], "has_more": n + 1 < pages, "cursor": nxt}
+
+        monkeypatch.setattr(XhsClient, "get_comments", fake_get_comments)
+        return calls
+
+    def test_unlimited_pages_fetches_until_exhausted(self, monkeypatch):
+        self._paged(monkeypatch, pages=25)
+        client = XhsClient({"a1": "cookie"})
+        try:
+            data = client.get_all_comments("n", max_pages=None)
+        finally:
+            client.close()
+        assert data["total_fetched"] == 25
+        assert data["pages_fetched"] == 25
+
+    def test_repeating_cursor_stops_pagination(self, monkeypatch):
+        calls = self._paged(monkeypatch, pages=100, repeat_after=3)
+        client = XhsClient({"a1": "cookie"})
+        try:
+            client.get_all_comments("n", max_pages=None)
+        finally:
+            client.close()
+        assert len(calls) <= 5

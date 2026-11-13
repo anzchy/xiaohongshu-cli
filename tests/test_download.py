@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import httpx
+import pytest
 
 from xhs_cli.download import DownloadOptions, download_note
 
@@ -45,7 +46,7 @@ class FakeClient:
         self.calls.append(("detail", note_id, xsec_token))
         return {"items": [{"id": note_id, "note_card": self.card}]}
 
-    def get_all_comments(self, note_id, xsec_token="", xsec_source=""):
+    def get_all_comments(self, note_id, xsec_token="", xsec_source="", max_pages=20):
         self.calls.append(("comments", note_id, xsec_token))
         return {"comments": self.comments, "has_more": False}
 
@@ -251,3 +252,89 @@ class TestMarkdown:
         result = download_note(FakeClient(note_card(image_list=[])), "note1", out_dir=tmp_path, http=media_http({}))
 
         assert json.loads((result.folder / "note.json").read_text())["title"] == "好用的锅/工程师"
+
+
+def test_comment_tree_requests_every_page(tmp_path):
+    class Recording(FakeClient):
+        def get_all_comments(self, note_id, xsec_token="", xsec_source="", max_pages=20):
+            self.calls.append(("comments-max-pages", max_pages))
+            return {"comments": []}
+
+    client = Recording(note_card(image_list=[]))
+    download_note(client, "note1", out_dir=tmp_path, http=media_http({}), options=DownloadOptions(comments=True))
+
+    assert ("comments-max-pages", None) in client.calls
+
+
+class TestPathSafety:
+    @pytest.mark.parametrize("bad_id", ["../../escape", "..", "a/b", "http://xhslink.com/a/x", ""])
+    def test_unsafe_note_id_is_rejected_before_any_request_or_write(self, tmp_path, bad_id):
+        from xhs_cli.exceptions import XhsApiError
+
+        out = tmp_path / "out"
+        client = FakeClient(note_card())
+        with pytest.raises(XhsApiError, match="note id"):
+            download_note(client, bad_id, out_dir=out, http=media_http({}))
+        assert client.calls == []
+        assert not out.exists() or list(out.iterdir()) == []
+
+
+class TestMediaValidation:
+    def test_html_200_is_not_saved_as_image_and_next_candidate_is_tried(self, tmp_path):
+        dft = "http://sns-webpic-qc.xhscdn.com/sig/notes_pre_post/aaa!nd_dft_wlteh_webp_3"
+        http = media_http({
+            ORIGINAL: (200, b"<html>blocked</html>" * 100, "text/html"),
+            dft: (200, b"RIFF" + b"w" * 20_000, "image/webp"),
+        })
+
+        result = download_note(FakeClient(note_card()), "note1", out_dir=tmp_path, http=http)
+
+        assert [p.name for p in result.media] == ["01.webp"]
+        assert result.failed == []
+
+    def test_octet_stream_is_typed_by_magic_bytes(self, tmp_path):
+        http = media_http({ORIGINAL: (200, JPEG, "application/octet-stream")})
+
+        result = download_note(FakeClient(note_card()), "note1", out_dir=tmp_path, http=http)
+
+        assert [p.name for p in result.media] == ["01.jpg"]
+
+    def test_octet_stream_with_unknown_bytes_is_rejected(self, tmp_path):
+        http = media_http({ORIGINAL: (200, b"garbage" * 1000, "application/octet-stream")})
+
+        result = download_note(FakeClient(note_card()), "note1", out_dir=tmp_path, http=http)
+
+        assert result.media == []
+        assert result.failed == ["image 01"]
+
+
+class TestInterruptedDownloads:
+    def test_leftover_part_file_is_not_treated_as_done(self, tmp_path):
+        images = tmp_path / "note1_好用的锅_工程师" / "images"
+        images.mkdir(parents=True)
+        (images / "01.jpg.part").write_bytes(JPEG[:100])
+        http = media_http({ORIGINAL: (200, JPEG, "image/jpeg")})
+
+        result = download_note(FakeClient(note_card()), "note1", out_dir=tmp_path, http=http)
+
+        assert [p.name for p in result.media] == ["01.jpg"]
+        assert result.skipped == 0
+        assert sorted(p.name for p in images.iterdir()) == ["01.jpg"]
+
+    def test_write_failure_leaves_no_final_file(self, tmp_path, monkeypatch):
+        from pathlib import Path
+
+        real_replace = Path.replace
+
+        def crash_on_replace(self, target):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(Path, "replace", crash_on_replace)
+        http = media_http({ORIGINAL: (200, JPEG, "image/jpeg")})
+
+        with pytest.raises(OSError):
+            download_note(FakeClient(note_card()), "note1", out_dir=tmp_path, http=http)
+
+        monkeypatch.setattr(Path, "replace", real_replace)
+        images = tmp_path / "note1_好用的锅_工程师" / "images"
+        assert not (images / "01.jpg").exists()

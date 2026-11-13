@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+import httpx
 import pytest
 from click.testing import CliRunner
 
@@ -130,3 +131,31 @@ class TestRateLimiting:
 
         assert result.exit_code == 0, result.output
         assert created["request_delay"] == 3.5
+
+
+def test_unsafe_id_in_batch_is_a_per_note_failure(fake_client, tmp_path):
+    result, payload = run_json(["../evil", "ok1", "-o", str(tmp_path)])
+
+    assert result.exit_code == 1
+    assert [(e["note_id"], e["ok"]) for e in payload["data"]["results"]] == [("../evil", False), ("ok1", True)]
+    assert not (tmp_path.parent / "evil").exists()
+
+
+def test_media_failure_marks_note_not_ok_and_exits_nonzero(monkeypatch, tmp_path):
+    class WithDeadImage(FakeClient):
+        def get_note_detail(self, note_id, xsec_token="", xsec_source=""):
+            return {"items": [{"note_card": {"title": "t", "image_list": [{"file_id": "f/dead"}]}}]}
+
+    monkeypatch.setattr("xhs_cli.commands.download.run_client_action", lambda ctx, action: action(WithDeadImage()))
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        "xhs_cli.download.httpx.Client",
+        lambda **kw: real_client(transport=httpx.MockTransport(lambda r: httpx.Response(404))),
+    )
+
+    result, payload = run_json(["n1", "-o", str(tmp_path)])
+
+    assert result.exit_code == 1
+    [entry] = payload["data"]["results"]
+    assert entry["ok"] is False
+    assert entry["failed"] == ["image 01"]

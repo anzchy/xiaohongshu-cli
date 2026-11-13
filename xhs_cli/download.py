@@ -74,6 +74,15 @@ class DownloadResult:
     replies: int = 0
 
 
+_NOTE_ID_RE = re.compile(r"^[0-9A-Za-z]{1,64}$")
+
+
+def _validate_note_id(note_id: str) -> None:
+    """Note IDs end up in filesystem paths; accept only plain alphanumerics (XHS uses 24 hex chars)."""
+    if not _NOTE_ID_RE.match(note_id or ""):
+        raise XhsApiError(f"Invalid note id {note_id!r} — pass a note URL, a 24-char note id, or a short index")
+
+
 def _safe_name(text: str, limit: int = 40) -> str:
     cleaned = re.sub(r'[\\/:*?"<>|\s]+', "_", text).strip("._")
     return cleaned[:limit]
@@ -109,7 +118,7 @@ def _video_candidates(video: dict[str, Any]) -> list[str]:
 
 def fetch_comment_tree(client, note_id: str, *, xsec_token: str = "", xsec_source: str = "") -> list[dict]:
     """All top-level comments, each with its complete ``sub_comments`` list."""
-    data = client.get_all_comments(note_id, xsec_token=xsec_token, xsec_source=xsec_source)
+    data = client.get_all_comments(note_id, xsec_token=xsec_token, xsec_source=xsec_source, max_pages=None)
     comments = data.get("comments", []) if isinstance(data, dict) else []
     for top in comments:
         replies = list(top.get("sub_comments") or [])
@@ -128,6 +137,24 @@ def fetch_comment_tree(client, note_id: str, *, xsec_token: str = "", xsec_sourc
     return comments
 
 
+def _sniff_ext(data: bytes) -> str | None:
+    """File extension from magic bytes, or None when the body is not a known media type."""
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if data.startswith(b"\x89PNG"):
+        return ".png"
+    if data.startswith(b"GIF8"):
+        return ".gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    if data[4:8] == b"ftyp":
+        brand = data[8:12]
+        if brand in (b"heic", b"heix", b"mif1", b"msf1", b"hevc"):
+            return ".heic"
+        return ".mp4"
+    return None
+
+
 def _fetch(http: httpx.Client, url: str, stem: Path) -> Path | None:
     try:
         resp = http.get(url, headers=_MEDIA_HEADERS)
@@ -136,10 +163,27 @@ def _fetch(http: httpx.Client, url: str, stem: Path) -> Path | None:
         return None
     if resp.status_code != 200 or not resp.content:
         return None
-    ctype = resp.headers.get("content-type", "").split(";")[0].strip()
-    path = stem.with_suffix(_EXT_BY_TYPE.get(ctype, ".jpg"))
-    path.write_bytes(resp.content)
+    ctype = resp.headers.get("content-type", "").split(";")[0].strip().lower()
+    ext = _EXT_BY_TYPE.get(ctype) or _sniff_ext(resp.content)
+    if not ext:
+        logger.debug("Rejecting non-media response (%s) from %s", ctype or "no content-type", url[:80])
+        return None
+    path = stem.with_suffix(ext)
+    part = path.with_name(path.name + ".part")
+    part.write_bytes(resp.content)
+    part.replace(path)  # atomic: an interrupted write never leaves a "finished" file
     return path
+
+
+def _completed(directory: Path, stem: str) -> list[Path]:
+    """Finished files named ``stem.*``; leftover ``.part`` files from interrupted runs are removed."""
+    done = []
+    for path in sorted(directory.glob(f"{stem}.*")):
+        if path.suffix == ".part":
+            path.unlink(missing_ok=True)
+        else:
+            done.append(path)
+    return done
 
 
 def download_note(
@@ -155,8 +199,11 @@ def download_note(
 ) -> DownloadResult:
     """Download one note into ``out_dir/<note_id>_<title>/``."""
     options = options or DownloadOptions()
+    _validate_note_id(note_id)
     card = _note_card(client.get_note_detail(note_id, xsec_token=xsec_token, xsec_source=xsec_source))
     folder = Path(out_dir) / f"{note_id}_{_safe_name(card.get('title', ''))}".rstrip("_")
+    if not folder.resolve().is_relative_to(Path(out_dir).resolve()):
+        raise XhsApiError(f"Refusing to write outside {out_dir}: {folder}")
     images_dir = folder / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
     (folder / "note.json").write_text(json.dumps(card, ensure_ascii=False, indent=1))
@@ -166,7 +213,7 @@ def download_note(
     http = http or httpx.Client(timeout=60, follow_redirects=True)
     try:
         for index, img in enumerate(card.get("image_list", []), 1):
-            existing = sorted(images_dir.glob(f"{index:02d}.*"))
+            existing = _completed(images_dir, f"{index:02d}")
             if existing:
                 result.media.append(existing[0])
                 result.skipped += 1
@@ -185,7 +232,7 @@ def download_note(
                 result.failed.append(f"image {index:02d}")
         video = card.get("video")
         if video:
-            existing = sorted(folder.glob("video.*"))
+            existing = _completed(folder, "video")
             if existing:
                 result.media.append(existing[0])
                 result.skipped += 1
@@ -239,6 +286,28 @@ def render_note_md(card: dict[str, Any], note_id: str, result: DownloadResult, c
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _load_manifest(path: Path) -> dict[str, Any]:
+    """Load manifest.json; a corrupt one is moved aside to ``manifest.json.corrupt`` and treated as empty."""
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except (OSError, json.JSONDecodeError):
+        pass
+    backup = path.with_name(path.name + ".corrupt")
+    path.replace(backup)
+    logger.warning("Unreadable %s moved to %s; re-checking every note", path.name, backup.name)
+    return {}
+
+
+def _write_json_atomic(path: Path, data: Any) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp.replace(path)
+
+
 @dataclass
 class ExportResult:
     downloaded: list[str] = field(default_factory=list)
@@ -265,13 +334,14 @@ def export_notes(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = out_dir / "manifest.json"
-    manifest: dict[str, Any] = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+    manifest = _load_manifest(manifest_path)
     result = ExportResult()
 
     own_http = http is None
     http = http or httpx.Client(timeout=60, follow_redirects=True)
     try:
         cursor = ""
+        seen_cursors: set[str] = set()
         while True:
             page = fetch_page(cursor)
             for note in page.get("notes", []):
@@ -295,12 +365,21 @@ def export_notes(
                 except XhsApiError as exc:
                     result.failed[note_id] = str(exc)
                     continue
+                if res.failed:
+                    # Leave it out of the manifest so the next run retries the missing media.
+                    result.failed[note_id] = "media failed: " + ", ".join(res.failed)
+                    continue
                 manifest[note_id] = {"folder": res.folder.name, "title": note.get("display_title", "")}
-                manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=1))
+                _write_json_atomic(manifest_path, manifest)
                 result.downloaded.append(note_id)
             cursor = page.get("cursor", "")
             if not page.get("has_more") or not cursor:
                 return result
+            if cursor in seen_cursors:
+                logger.warning("Listing returned an already-seen cursor %r; stopping", cursor)
+                result.aborted = "pagination loop"
+                return result
+            seen_cursors.add(cursor)
     finally:
         if own_http:
             http.close()

@@ -99,7 +99,7 @@ def download(ctx, refs, from_index, url_file, out_dir, fmt, with_comments, markd
                 continue
             results.append({
                 "note_id": note_id,
-                "ok": True,
+                "ok": not res.failed,
                 "folder": str(res.folder),
                 "media": [str(p) for p in res.media],
                 "skipped": res.skipped,
@@ -115,7 +115,7 @@ def download(ctx, refs, from_index, url_file, out_dir, fmt, with_comments, markd
         exit_for_error(exc, as_json=as_json, as_yaml=as_yaml)
     if not maybe_print_structured(data, as_json=as_json, as_yaml=as_yaml):
         for entry in data["results"]:
-            if entry["ok"]:
+            if "folder" in entry:
                 extra = f", {entry['comments']} comments + {entry['replies']} replies" if with_comments else ""
                 print_success(f"{entry['note_id']}: {len(entry['media'])} media{extra} → {entry['folder']}")
                 for item in entry["failed"]:
@@ -157,9 +157,11 @@ def _export_command(ctx, fetcher, user_id, out_dir, fmt, with_comments, markdown
         print_success(f"{len(data['downloaded'])} new notes → {out_dir} ({data['already_archived']} already archived)")
         for note_id, err in data["failed"].items():
             print_error(f"{note_id}: {err}")
-        if data["aborted"]:
+        if data["aborted"] == "captcha":
             print_error("Stopped at a captcha — wait, then re-run to resume. Consider a larger --delay.")
-    if data["failed"]:
+        elif data["aborted"]:
+            print_error(f"Stopped early ({data['aborted']}) — re-run to resume.")
+    if data["failed"] or data["aborted"]:
         raise SystemExit(1)
 
 

@@ -180,3 +180,93 @@ class TestNoteIndexCache:
             "xsec_token": "",
             "xsec_source": "",
         }
+
+
+class _Cookie:
+    def __init__(self, name, value):
+        self.name, self.value, self.domain = name, value, ".xiaohongshu.com"
+
+
+class TestBrowserProfiles:
+    """`login --profile`: read cookies from a specific (or every) Chromium profile."""
+
+    def _chrome_dir(self, tmp_path, monkeypatch, profiles_with_a1, profiles_without=()):
+        from pathlib import Path
+
+        monkeypatch.setattr("sys.platform", "darwin")
+        root = Path(tmp_path) / "Library/Application Support/Google/Chrome"
+        for name in [*profiles_with_a1, *profiles_without]:
+            (root / name).mkdir(parents=True)
+            (root / name / "Cookies").write_bytes(b"")
+        opened = []
+
+        def fake_chrome(cookie_file=None, domain_name=""):
+            opened.append(cookie_file)
+            profile = Path(cookie_file).parent.name
+            return [_Cookie("a1", f"a1-{profile}")] if profile in profiles_with_a1 else [_Cookie("webId", "x")]
+
+        monkeypatch.setattr("xhs_cli.cookies._get_browser_loader", lambda source: fake_chrome)
+        monkeypatch.setattr("xhs_cli.cookies._extract_via_subprocess", lambda *a, **k: None)
+        return root, opened
+
+    def test_named_profile_reads_that_profiles_cookie_db(self, tmp_path, monkeypatch):
+        from xhs_cli.cookies import extract_browser_cookies
+
+        root, opened = self._chrome_dir(tmp_path, monkeypatch, ["Profile 1"], ["Default"])
+
+        browser, cookies = extract_browser_cookies("chrome", profile="Profile 1")
+
+        assert opened == [str(root / "Profile 1" / "Cookies")]
+        assert (browser, cookies["a1"]) == ("chrome:Profile 1", "a1-Profile 1")
+
+    def test_auto_profile_tries_each_profile_until_a1_found(self, tmp_path, monkeypatch):
+        from xhs_cli.cookies import extract_browser_cookies
+
+        root, opened = self._chrome_dir(tmp_path, monkeypatch, ["Profile 2"], ["Default", "Profile 1"])
+
+        browser, cookies = extract_browser_cookies("chrome", profile="auto")
+
+        assert opened[0] == str(root / "Default" / "Cookies")
+        assert (browser, cookies["a1"]) == ("chrome:Profile 2", "a1-Profile 2")
+
+    def test_unknown_profile_returns_none(self, tmp_path, monkeypatch):
+        from xhs_cli.cookies import extract_browser_cookies
+
+        self._chrome_dir(tmp_path, monkeypatch, ["Default"])
+
+        assert extract_browser_cookies("chrome", profile="Nope") is None
+
+    def test_auto_source_falls_back_to_non_default_profiles(self, tmp_path, monkeypatch):
+        from xhs_cli.cookies import extract_browser_cookies
+
+        self._chrome_dir(tmp_path, monkeypatch, ["Profile 1"], ["Default"])
+        monkeypatch.setattr("xhs_cli.cookies._available_browsers", lambda: ("chrome",))
+        monkeypatch.setattr("xhs_cli.cookies._extract_in_process", _only_with_cookie_file)
+
+        browser, cookies = extract_browser_cookies("auto")
+
+        assert (browser, cookies["a1"]) == ("chrome:Profile 1", "a1-Profile 1")
+
+    def test_get_cookies_passes_profile_and_saves_result(self, monkeypatch):
+        from xhs_cli.cookies import get_cookies
+
+        seen = {}
+
+        def fake_extract(source, profile=None):
+            seen.update(source=source, profile=profile)
+            return "chrome:Profile 1", {"a1": "x"}
+
+        monkeypatch.setattr("xhs_cli.cookies.extract_browser_cookies", fake_extract)
+
+        assert get_cookies("chrome", force_refresh=True, profile="Profile 1") == ("chrome:Profile 1", {"a1": "x"})
+        assert seen == {"source": "chrome", "profile": "Profile 1"}
+        assert load_saved_cookies()["a1"] == "x"
+
+
+def _only_with_cookie_file(source, cookie_file=None):
+    """Default-path extraction finds nothing; per-profile extraction finds a1 only in Profile 1."""
+    from pathlib import Path
+
+    if cookie_file and Path(cookie_file).parent.name == "Profile 1":
+        return {"a1": "a1-Profile 1"}
+    return None

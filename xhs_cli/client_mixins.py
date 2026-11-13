@@ -472,12 +472,18 @@ class ReadingEndpointsMixin:
         root_comment_id: str,
         num: int = 30,
         cursor: str = "",
+        xsec_token: str = "",
     ) -> Any:
+        # Without xsec_token XHS answers this endpoint with a captcha (461).
+        token = xsec_token or get_cached_note_context(note_id).get("token", "")
         return self._main_api_get("/api/sns/web/v2/comment/sub/page", {
             "note_id": note_id,
             "root_comment_id": root_comment_id,
             "num": num,
             "cursor": cursor,
+            "image_formats": "jpg,webp,avif",
+            "top_comment_id": "",
+            "xsec_token": token,
         })
 
 

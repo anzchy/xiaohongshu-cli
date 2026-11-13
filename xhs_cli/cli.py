@@ -31,7 +31,7 @@ import sys
 import click
 
 from . import __version__
-from .commands import auth, creator, interactions, notifications, reading, social
+from .commands import auth, creator, download, interactions, notifications, reading, social
 
 
 def _fix_windows_encoding() -> None:
@@ -56,11 +56,19 @@ _fix_windows_encoding()
     show_default=True,
     help="Browser to read cookies from (auto = try all installed browsers)",
 )
+@click.option(
+    "--delay",
+    type=click.FloatRange(min=0),
+    default=None,
+    help="Minimum seconds between API requests (default 1.0; raise for big batches)",
+)
 @click.pass_context
-def cli(ctx, verbose: bool, cookie_source: str):
+def cli(ctx, verbose: bool, cookie_source: str, delay: float | None):
     """xhs — Xiaohongshu CLI via reverse-engineered API 📕"""
     ctx.ensure_object(dict)
     ctx.obj["cookie_source"] = cookie_source
+    if delay is not None:
+        ctx.obj["request_delay"] = delay
 
     if verbose:
         logging.basicConfig(level=logging.DEBUG, format="%(name)s %(message)s")
@@ -87,6 +95,10 @@ cli.add_command(reading.feed)
 cli.add_command(reading.hot)
 cli.add_command(reading.topics)
 cli.add_command(reading.search_user)
+cli.add_command(reading.token)
+cli.add_command(download.download)
+cli.add_command(download.export_favorites)
+cli.add_command(download.export_user)
 
 # ─── Interaction commands ────────────────────────────────────────────────────
 

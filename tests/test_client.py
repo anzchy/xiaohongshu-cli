@@ -276,3 +276,41 @@ class TestReadingEndpointBehavior:
 
         assert result["items"][0]["note_card"]["title"] == "html-ok"
         assert get_cached_note_context("note-123") == {}
+
+
+class TestSubComments:
+    def _capture_get(self, monkeypatch):
+        captured = {}
+
+        def fake_get(self, uri, params=None):
+            captured["uri"] = uri
+            captured["params"] = params
+            return {"comments": [], "has_more": False, "cursor": ""}
+
+        monkeypatch.setattr(XhsClient, "_main_api_get", fake_get)
+        return captured
+
+    def test_sub_comments_send_explicit_xsec_token(self, monkeypatch):
+        captured = self._capture_get(monkeypatch)
+        client = XhsClient({"a1": "cookie"})
+        try:
+            client.get_sub_comments("note-1", "cmt-1", cursor="c-9", xsec_token="tok-abc")
+        finally:
+            client.close()
+
+        assert captured["uri"] == "/api/sns/web/v2/comment/sub/page"
+        assert captured["params"]["xsec_token"] == "tok-abc"
+        assert captured["params"]["image_formats"] == "jpg,webp,avif"
+        assert captured["params"]["root_comment_id"] == "cmt-1"
+        assert captured["params"]["cursor"] == "c-9"
+
+    def test_sub_comments_reuse_cached_xsec_token(self, monkeypatch):
+        captured = self._capture_get(monkeypatch)
+        cache_note_context("note-1", "cached-tok", "pc_share")
+        client = XhsClient({"a1": "cookie"})
+        try:
+            client.get_sub_comments("note-1", "cmt-1")
+        finally:
+            client.close()
+
+        assert captured["params"]["xsec_token"] == "cached-tok"

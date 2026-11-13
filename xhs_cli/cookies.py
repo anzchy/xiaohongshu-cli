@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import os
 import subprocess
 import sys
 import threading
@@ -273,6 +274,18 @@ def save_note_index(items: list[dict[str, str]]) -> None:
     logger.debug("Saved note index with %d entries", len(normalized))
 
 
+def load_note_index() -> list[dict[str, str]]:
+    """All entries of the last listing, in order (empty if none)."""
+    path = get_index_cache_path()
+    try:
+        data = json.loads(path.read_text()) if path.exists() else []
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [entry for entry in (_normalize_index_entry(item) for item in data) if entry]
+
+
 def get_note_by_index(index: int) -> dict[str, str] | None:
     """Resolve a 1-based short index to a cached note reference."""
     if index <= 0:
@@ -347,7 +360,74 @@ def _get_browser_loader(source: str):
     return loader
 
 
-def _extract_in_process(source: str) -> dict[str, str] | None:
+_CHROMIUM_DATA_DIRS = {
+    # browser -> (macOS path under ~/Library/Application Support, Linux path under ~/.config,
+    #             Windows path under %LOCALAPPDATA%)
+    "chrome": ("Google/Chrome", "google-chrome", "Google/Chrome/User Data"),
+    "chromium": ("Chromium", "chromium", "Chromium/User Data"),
+    "brave": ("BraveSoftware/Brave-Browser", "BraveSoftware/Brave-Browser", "BraveSoftware/Brave-Browser/User Data"),
+    "edge": ("Microsoft Edge", "microsoft-edge", "Microsoft/Edge/User Data"),
+    "arc": ("Arc/User Data", "", ""),
+    "vivaldi": ("Vivaldi", "vivaldi", "Vivaldi/User Data"),
+    "opera": ("com.operasoftware.Opera", "opera", ""),
+}
+
+
+def _chromium_user_data_dir(browser: str) -> Path | None:
+    paths = _CHROMIUM_DATA_DIRS.get(browser)
+    if not paths:
+        return None
+    mac, linux, win = paths
+    home = Path.home()
+    if sys.platform == "darwin":
+        rel = home / "Library/Application Support" / mac if mac else None
+    elif sys.platform.startswith("win"):
+        local = os.environ.get("LOCALAPPDATA", str(home / "AppData/Local"))
+        rel = Path(local) / win if win else None
+    else:
+        rel = home / ".config" / linux if linux else None
+    return rel
+
+
+def _profile_sort_key(name: str) -> tuple[int, int, str]:
+    if name == "Default":
+        return (0, 0, name)
+    if name.startswith("Profile "):
+        suffix = name.removeprefix("Profile ")
+        return (1, int(suffix) if suffix.isdigit() else 0, name)
+    return (2, 0, name)
+
+
+def list_browser_profiles(browser: str) -> list[tuple[str, Path]]:
+    """``(profile_name, cookie_db_path)`` for every profile of a Chromium-based browser."""
+    root = _chromium_user_data_dir(browser)
+    if not root or not root.is_dir():
+        return []
+    profiles = []
+    for entry in root.iterdir():
+        if not entry.is_dir() or entry.name in {"System Profile", "Guest Profile"}:
+            continue
+        for candidate in (entry / "Cookies", entry / "Network" / "Cookies"):
+            if candidate.is_file():
+                profiles.append((entry.name, candidate))
+                break
+    return sorted(profiles, key=lambda item: _profile_sort_key(item[0]))
+
+
+def _extract_profile(source: str, profile: str) -> tuple[str, dict[str, str]] | None:
+    """Extract from one named profile, or every profile in order when *profile* is ``"auto"``."""
+    browser = "chrome" if source == "auto" else source
+    for name, cookie_db in list_browser_profiles(browser):
+        if profile != "auto" and name != profile:
+            continue
+        cookies = _extract_in_process(browser, cookie_file=str(cookie_db))
+        if cookies:
+            return f"{browser}:{name}", cookies
+        logger.debug("No a1 cookie in %s profile %r", browser, name)
+    return None
+
+
+def _extract_in_process(source: str, cookie_file: str | None = None) -> dict[str, str] | None:
     """Extract cookies in-process for macOS Keychain compatibility."""
     try:
         loader = _get_browser_loader(source)
@@ -359,7 +439,8 @@ def _extract_in_process(source: str) -> dict[str, str] | None:
         return None
 
     try:
-        jar = loader(domain_name=".xiaohongshu.com")
+        kwargs = {"cookie_file": cookie_file} if cookie_file else {}
+        jar = loader(domain_name=".xiaohongshu.com", **kwargs)
     except Exception as exc:
         logger.debug("%s in-process extraction failed: %s", source, exc)
         return None
@@ -427,15 +508,21 @@ except Exception as e:
         return None
 
 
-def extract_browser_cookies(source: str = "auto") -> tuple[str, dict[str, str]] | None:
+def extract_browser_cookies(source: str = "auto", profile: str | None = None) -> tuple[str, dict[str, str]] | None:
     """
     Extract XHS cookies from browser using browser-cookie3.
 
     When *source* is ``"auto"``, tries supported browsers with a small
     thread pool and returns the first one that has valid cookies.
 
+    When *profile* is given (a Chromium profile directory name such as
+    ``"Profile 1"``, or ``"auto"`` for every profile), only that browser's
+    profiles are read; ``source="auto"`` then means Chrome.
+
     Returns ``(browser_name, cookies)`` on success, or ``None``.
     """
+    if profile:
+        return _extract_profile(source, profile)
     if source != "auto":
         cookies = _extract_in_process(source)
         if cookies:
@@ -475,11 +562,17 @@ def extract_browser_cookies(source: str = "auto") -> tuple[str, dict[str, str]] 
                         rest.cancel()
                     return result
 
+    # Default profiles had nothing: the session may live in another Chromium profile.
+    for browser in browsers:
+        if browser in _CHROMIUM_DATA_DIRS:
+            result = _extract_profile(browser, "auto")
+            if result:
+                return result
     return None
 
 
 def get_cookies(
-    cookie_source: str = "auto", *, force_refresh: bool = False
+    cookie_source: str = "auto", *, force_refresh: bool = False, profile: str | None = None
 ) -> tuple[str, dict[str, str]]:
     """
     Multi-strategy cookie acquisition with TTL-based auto-refresh.
@@ -513,7 +606,10 @@ def get_cookies(
     # 2. Try browser extraction
     from .exceptions import NoCookieError
 
-    result = extract_browser_cookies(cookie_source)
+    if profile:
+        result = extract_browser_cookies(cookie_source, profile=profile)
+    else:
+        result = extract_browser_cookies(cookie_source)
     if result:
         save_cookies(result[1])
         return result

@@ -1,5 +1,7 @@
 """Reading commands: search, read, comments, sub-comments, user, user-posts, feed, hot, topics, search-user."""
 
+from pathlib import Path
+
 import click
 
 from ..command_normalizers import normalize_paged_notes
@@ -16,7 +18,7 @@ from ..formatter import (
     render_user_posts,
     render_users,
 )
-from ..note_refs import resolve_note_reference, save_index_from_items, save_index_from_notes
+from ..note_refs import expand_share_link, resolve_note_reference, save_index_from_items, save_index_from_notes
 from ._common import exit_for_error, handle_command, run_client_action, structured_output_options
 
 # ─── Token propagation ─────────────────────────────────────────────────────
@@ -111,14 +113,39 @@ def read(ctx, id_or_url: str, xsec_token: str, as_json: bool, as_yaml: bool):
 @click.option("--cursor", default="", help="Pagination cursor")
 @click.option("--xsec-token", default="", help="Security token")
 @click.option("--all", "fetch_all", is_flag=True, help="Auto-paginate to fetch ALL comments")
+@click.option("--md", "as_md", is_flag=True, help="Export the full tree (all comments + all replies) as Markdown")
+@click.option("--csv", "as_csv", is_flag=True, help="Export the full tree (all comments + all replies) as CSV")
+@click.option("-o", "--output", type=click.Path(dir_okay=False), default=None, help="Write --md/--csv to a file")
 @structured_output_options
 @click.pass_context
-def comments(ctx, id_or_url: str, cursor: str, xsec_token: str, fetch_all: bool, as_json: bool, as_yaml: bool):
+def comments(
+    ctx, id_or_url: str, cursor: str, xsec_token: str, fetch_all: bool,
+    as_md: bool, as_csv: bool, output: str | None, as_json: bool, as_yaml: bool,
+):
     """View comments on a note by ID, URL, or short index."""
     note_id, token, url_source = resolve_note_reference(id_or_url, xsec_token=xsec_token)
     xsec_source = url_source or "pc_feed"
     if token:
         cache_note_context(note_id, token, xsec_source)
+
+    if as_md or as_csv:
+        from ..comment_export import render_comments_csv, render_comments_md
+        from ..download import fetch_comment_tree
+
+        try:
+            tree = run_client_action(
+                ctx,
+                lambda client: fetch_comment_tree(client, note_id, xsec_token=token, xsec_source=url_source),
+            )
+        except Exception as exc:
+            exit_for_error(exc, as_json=False, as_yaml=False)
+        text = render_comments_md(tree) if as_md else render_comments_csv(tree)
+        if output:
+            Path(output).write_text(text, encoding="utf-8")
+            print_info(f"Wrote {len(tree)} comments to {output}")
+        else:
+            click.echo(text, nl=False)
+        return
 
     def _load_comments(client):
         common_kwargs = {"xsec_token": token}
@@ -226,16 +253,22 @@ def topics(ctx, keyword: str, as_json: bool, as_yaml: bool):
 
 
 @click.command("sub-comments")
-@click.argument("note_id")
+@click.argument("id_or_url")
 @click.argument("comment_id")
 @click.option("--cursor", default="", help="Pagination cursor")
+@click.option("--xsec-token", default="", help="Security token (or reuse a cached token for this note)")
 @structured_output_options
 @click.pass_context
-def sub_comments(ctx, note_id: str, comment_id: str, cursor: str, as_json: bool, as_yaml: bool):
-    """View replies to a specific comment."""
+def sub_comments(
+    ctx, id_or_url: str, comment_id: str, cursor: str, xsec_token: str, as_json: bool, as_yaml: bool
+):
+    """View replies to a specific comment (note by ID, URL, or short index)."""
+    note_id, token, url_source = resolve_note_reference(id_or_url, xsec_token=xsec_token)
+    if token:
+        cache_note_context(note_id, token, url_source or "pc_feed")
     handle_command(
         ctx,
-        action=lambda client: client.get_sub_comments(note_id, comment_id, cursor=cursor),
+        action=lambda client: client.get_sub_comments(note_id, comment_id, cursor=cursor, xsec_token=token),
         render=render_comments,
         as_json=as_json,
         as_yaml=as_yaml,
@@ -295,3 +328,27 @@ def hot(ctx, category: str, as_json: bool, as_yaml: bool):
         as_json=as_json,
         as_yaml=as_yaml,
     )
+
+
+@click.command()
+@click.argument("url_or_share_text")
+@structured_output_options
+def token(url_or_share_text: str, as_json: bool, as_yaml: bool):
+    """Extract note ID + xsec_token from a note URL, xhslink.com short link, or share text."""
+    from ..formatter import parse_note_reference
+
+    url = expand_share_link(url_or_share_text)
+    note_id, xsec_token, xsec_source = parse_note_reference(url)
+    if not xsec_token:
+        raise click.UsageError(f"No xsec_token in {url!r} — copy the link via the app's Share → Copy link")
+    cache_note_context(note_id, xsec_token, xsec_source or "pc_feed")
+    query = f"xsec_token={xsec_token}" + (f"&xsec_source={xsec_source}" if xsec_source else "")
+    data = {
+        "note_id": note_id,
+        "xsec_token": xsec_token,
+        "xsec_source": xsec_source,
+        "url": f"https://www.xiaohongshu.com/explore/{note_id}?{query}",
+    }
+    if not maybe_print_structured(data, as_json=as_json, as_yaml=as_yaml):
+        for key in ("note_id", "xsec_token", "xsec_source", "url"):
+            click.echo(f"{key + ':':<13}{data[key]}")

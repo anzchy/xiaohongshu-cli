@@ -542,3 +542,183 @@ class TestCliBasic:
             {"note_id": "note-1", "xsec_token": "", "xsec_source": ""},
             {"note_id": "note-2", "xsec_token": "", "xsec_source": ""},
         ]]
+
+
+class TestSubCommentsCommand:
+    def _fake_client(self, monkeypatch):
+        called = {}
+
+        class FakeClient:
+            def get_sub_comments(self, note_id, comment_id, cursor="", **kwargs):
+                called.update(note_id=note_id, comment_id=comment_id, cursor=cursor, kwargs=kwargs)
+                return {"comments": []}
+
+        monkeypatch.setattr(
+            "xhs_cli.commands._common.run_client_action", lambda ctx, action: action(FakeClient())
+        )
+        return called
+
+    def test_sub_comments_accepts_note_url_and_passes_its_token(self, monkeypatch):
+        called = self._fake_client(monkeypatch)
+        url = "https://www.xiaohongshu.com/explore/note-abc?xsec_token=tok-url&xsec_source=app_share"
+
+        result = runner.invoke(cli, ["sub-comments", url, "cmt-1", "--json"])
+
+        assert result.exit_code == 0, result.output
+        assert called["note_id"] == "note-abc"
+        assert called["comment_id"] == "cmt-1"
+        assert called["kwargs"]["xsec_token"] == "tok-url"
+
+    def test_sub_comments_accepts_explicit_xsec_token(self, monkeypatch):
+        called = self._fake_client(monkeypatch)
+
+        result = runner.invoke(cli, ["sub-comments", "note-abc", "cmt-1", "--xsec-token", "tok-x", "--json"])
+
+        assert result.exit_code == 0, result.output
+        assert called["kwargs"]["xsec_token"] == "tok-x"
+
+
+class TestCommentsExport:
+    URL = "https://www.xiaohongshu.com/explore/note-abc?xsec_token=tok-url&xsec_source=app_share"
+
+    def _fake(self, monkeypatch):
+        calls = []
+
+        class FakeClient:
+            def get_all_comments(self, note_id, **kwargs):
+                calls.append(("all", note_id, kwargs.get("xsec_token")))
+                return {"comments": [{
+                    "id": "c1", "content": "问", "user_info": {"nickname": "A", "user_id": "u"},
+                    "sub_comments": [], "sub_comment_has_more": True, "sub_comment_cursor": "",
+                }]}
+
+            def get_sub_comments(self, note_id, comment_id, cursor="", xsec_token="", **kw):
+                calls.append(("sub", comment_id, xsec_token))
+                return {"comments": [{"id": "r1", "content": "答", "user_info": {"nickname": "B"},
+                                      "show_tags": ["is_author"]}], "has_more": False, "cursor": ""}
+
+        monkeypatch.setattr("xhs_cli.commands.reading.run_client_action", lambda ctx, action: action(FakeClient()))
+        return calls
+
+    def test_comments_md_prints_full_tree(self, monkeypatch):
+        calls = self._fake(monkeypatch)
+
+        result = runner.invoke(cli, ["comments", self.URL, "--md"])
+
+        assert result.exit_code == 0, result.output
+        assert "- **A**" in result.output
+        assert "    - **B 【作者】**" in result.output
+        assert ("sub", "c1", "tok-url") in calls
+
+    def test_comments_csv_writes_output_file(self, monkeypatch, tmp_path):
+        self._fake(monkeypatch)
+        out = tmp_path / "c.csv"
+
+        result = runner.invoke(cli, ["comments", self.URL, "--csv", "-o", str(out)])
+
+        assert result.exit_code == 0, result.output
+        lines = out.read_text().splitlines()
+        assert lines[0].startswith("id,parent_id")
+        assert lines[2].startswith("r1,c1,")
+
+
+def test_login_profile_option_is_passed_to_cookie_extraction(monkeypatch):
+    seen = {}
+
+    def fake_get_cookies(source, force_refresh=False, profile=None):
+        seen.update(source=source, profile=profile)
+        return "chrome:Profile 1", {"a1": "x"}
+
+    class FakeClient:
+        def __init__(self, cookies): ...
+        def __enter__(self): return self
+        def __exit__(self, *a): ...
+        def get_self_info(self):
+            return {"basic_info": {"nickname": "Me", "red_id": "1"}, "guest": False}
+
+    monkeypatch.setattr("xhs_cli.commands.auth.get_cookies", fake_get_cookies)
+    monkeypatch.setattr("xhs_cli.commands.auth.XhsClient", FakeClient)
+
+    result = runner.invoke(cli, ["login", "--cookie-source", "chrome", "--profile", "Profile 1"])
+
+    assert result.exit_code == 0, result.output
+    assert seen == {"source": "chrome", "profile": "Profile 1"}
+
+
+class TestTokenCommand:
+    FULL = "https://www.xiaohongshu.com/discovery/item/note-abc?xsec_token=tok-1&xsec_source=app_share&type=normal"
+
+    def _mock_short_links(self, monkeypatch, seen):
+        import httpx
+
+        def handler(request):
+            seen.append(str(request.url))
+            return httpx.Response(302, headers={"location": self.FULL})
+
+        monkeypatch.setattr(
+            "xhs_cli.note_refs._redirect_client",
+            lambda: httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+    def test_full_url_prints_note_context_and_caches_token(self):
+        from xhs_cli.cookies import get_cached_note_context
+
+        result = runner.invoke(cli, ["token", self.FULL, "--json"])
+
+        assert result.exit_code == 0, result.output
+        data = yaml.safe_load(result.output)["data"]
+        assert data == {"note_id": "note-abc", "xsec_token": "tok-1", "xsec_source": "app_share",
+                        "url": "https://www.xiaohongshu.com/explore/note-abc?xsec_token=tok-1&xsec_source=app_share"}
+        assert get_cached_note_context("note-abc")["token"] == "tok-1"
+
+    def test_short_link_inside_share_text_is_expanded(self, monkeypatch):
+        seen = []
+        self._mock_short_links(monkeypatch, seen)
+        share = "88 小明发布了一篇小红书笔记，快来看吧！ 😆 abc 😆 http://xhslink.com/a/AbCd123 复制本条信息"
+
+        result = runner.invoke(cli, ["token", share, "--json"])
+
+        assert result.exit_code == 0, result.output
+        assert seen == ["http://xhslink.com/a/AbCd123"]
+        assert yaml.safe_load(result.output)["data"]["xsec_token"] == "tok-1"
+
+    def test_url_without_token_is_an_error(self):
+        result = runner.invoke(cli, ["token", "https://www.xiaohongshu.com/explore/note-abc"])
+
+        assert result.exit_code != 0
+        assert "xsec_token" in result.output
+
+
+class TestShortLinkHosts:
+    FULL = "https://www.xiaohongshu.com/discovery/item/abc123?xsec_token=tok-cn&xsec_source=app_share"
+
+    def _mock(self, monkeypatch, seen):
+        import httpx
+
+        def handler(request):
+            seen.append(str(request.url))
+            return httpx.Response(302, headers={"location": self.FULL})
+
+        monkeypatch.setattr(
+            "xhs_cli.note_refs._redirect_client", lambda: httpx.Client(transport=httpx.MockTransport(handler))
+        )
+
+    def test_xhslink_cn_share_text_is_expanded(self, monkeypatch):
+        seen = []
+        self._mock(monkeypatch, seen)
+
+        share = "好用的电压力锅，工程师会怎么选（二） 接上篇内容，... https://xhslink.cn/o/4g50FGN2BHT"
+        result = runner.invoke(cli, ["token", share, "--json"])
+
+        assert result.exit_code == 0, result.output
+        assert seen == ["https://xhslink.cn/o/4g50FGN2BHT"]
+        assert yaml.safe_load(result.output)["data"]["note_id"] == "abc123"
+
+    def test_host_merely_containing_xhslink_is_not_fetched(self, monkeypatch):
+        seen = []
+        self._mock(monkeypatch, seen)
+
+        result = runner.invoke(cli, ["token", "http://127.0.0.1:8080/private?xhslink.com"])
+
+        assert seen == []
+        assert result.exit_code != 0

@@ -54,11 +54,16 @@ def _print_status_summary(user: dict[str, object]) -> None:
     default=None,
     help="Browser to read cookies from (default: auto-detect all installed browsers)",
 )
+@click.option(
+    "--profile",
+    default=None,
+    help='Chromium profile dir to read, e.g. "Profile 1"; "auto" tries every profile',
+)
 @structured_output_options
 @click.option("--qrcode", "use_qrcode", is_flag=True, default=False,
               help="Login via QR code (scan with Xiaohongshu app)")
 @click.pass_context
-def login(ctx, cookie_source: str | None, as_json: bool, as_yaml: bool, use_qrcode: bool):
+def login(ctx, cookie_source: str | None, profile: str | None, as_json: bool, as_yaml: bool, use_qrcode: bool):
     """Log in by extracting cookies from browser, or via QR code."""
 
     if use_qrcode:
@@ -99,7 +104,7 @@ def login(ctx, cookie_source: str | None, as_json: bool, as_yaml: bool, use_qrco
         cookie_source = ctx.obj.get("cookie_source", "auto") if ctx.obj else "auto"
 
     def _login_with_browser() -> None:
-        browser, cookies = get_cookies(cookie_source, force_refresh=True)
+        browser, cookies = get_cookies(cookie_source, force_refresh=True, profile=profile)
         print_success(f"Cookies extracted from {browser}")
 
         # Verify by fetching user info, retry once if session not yet propagated

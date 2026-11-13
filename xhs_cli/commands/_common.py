@@ -34,7 +34,8 @@ def _cookie_source(ctx) -> str:
 def get_client(ctx, *, force_refresh: bool = False) -> XhsClient:
     """Get a local client from the click context."""
     _browser, cookies = get_cookies(_cookie_source(ctx), force_refresh=force_refresh)
-    return XhsClient(cookies)
+    delay = (ctx.obj or {}).get("request_delay") if ctx and ctx.obj else None
+    return XhsClient(cookies, request_delay=delay) if delay is not None else XhsClient(cookies)
 
 
 def run_client_action(ctx, action: Callable[[XhsClient], T]) -> T:
